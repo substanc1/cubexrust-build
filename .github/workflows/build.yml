@@ -1,0 +1,71 @@
+name: build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build
+        shell: bash
+        env:
+          CXR_KEY: ${{ secrets.CXR_KEY }}
+        run: |
+          set +x
+          set +e
+          echo "::add-mask::$CXR_KEY"
+          T=$RUNNER_TEMP; W=$T/w; L=$T/build.log
+          mkdir -p "$W" "$T/out"
+          printf '%s' "$CXR_KEY" > "$T/k"
+          chmod 600 "$T/k"
+          START=$(date +%s)
+          build() {
+            set -o pipefail
+            if ! command -v gpg >/dev/null 2>&1; then brew install gnupg || return 1; fi
+            if ! command -v zstd >/dev/null 2>&1; then brew install zstd || return 1; fi
+            gpg --batch --yes --pinentry-mode loopback --passphrase-file "$T/k" -d "$GITHUB_WORKSPACE/src.tar.zst.gpg" | zstd -d | tar -x -C "$W" || return 1
+            cd "$W" || return 1
+            rustup toolchain install stable --profile minimal -t aarch64-apple-darwin || return 1
+            rustup default stable || return 1
+            export CARGO_TERM_COLOR=never CARGO_TERM_PROGRESS_WHEN=never CARGO_BUILD_JOBS=3
+            cargo build --release --locked -p horizon-client --bin horizon-client --target aarch64-apple-darwin
+          }
+          rc=0
+          build >>"$L" 2>&1 || rc=$?
+          BIN=$W/target/aarch64-apple-darwin/release/horizon-client
+          RES=fail
+          if [ "$rc" -eq 0 ] && [ -f "$BIN" ] && gpg --batch --yes --pinentry-mode loopback --passphrase-file "$T/k" --symmetric --cipher-algo AES256 --compress-algo none -o "$T/out/horizon-client-macos-arm64.gpg" "$BIN" >>"$L" 2>&1; then
+            RES=ok
+          fi
+          gpg --batch --yes --pinentry-mode loopback --passphrase-file "$T/k" --symmetric --cipher-algo AES256 --compress-algo none -o "$T/out/build-log.gpg" "$L" >/dev/null 2>&1
+          END=$(date +%s)
+          { echo "CXR_RESULT=$RES"; echo "CXR_SECS=$((END-START))"; } >>"$GITHUB_ENV"
+          cd "$T"
+          rm -f "$T/k"
+          rm -rf "$W"
+          echo done
+
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: out
+          path: ${{ runner.temp }}/out/*.gpg
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: result
+        if: always()
+        shell: bash
+        run: |
+          R=${CXR_RESULT:-fail}
+          echo "result: $R"
+          echo "secs: ${CXR_SECS:-0}"
+          if [ "$R" != "ok" ]; then exit 1; fi

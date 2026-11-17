@@ -81,7 +81,7 @@ jobs:
             rustup toolchain install stable --profile minimal -t "$CXR_TARGET" || return 1
             rustup default stable || return 1
             export CARGO_TERM_COLOR=never CARGO_TERM_PROGRESS_WHEN=never CARGO_BUILD_JOBS=3
-            cargo build --release --locked -p horizon-client --bin horizon-client --target "$CXR_TARGET"
+            cargo build --release --locked -p horizon-native-game --bin horizon-client --target "$CXR_TARGET"
           }
           rc=0
           build >>"$L" 2>&1 || rc=$?

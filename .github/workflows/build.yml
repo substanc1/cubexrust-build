@@ -8,20 +8,66 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: horizon-client.exe
+          - name: linux-x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bin: horizon-client
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bin: horizon-client
+          - name: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            bin: horizon-client
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
+
+      - name: deps linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # по Cargo.lock: alsa-sys, libudev-sys, wayland-sys; x11/xkbcommon у winit грузятся динамически
+          # (проверить по логу: если линковка ругается на другое — добавить сюда)
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends gnupg zstd pkg-config libx11-dev libxkbcommon-dev libwayland-dev libasound2-dev libudev-dev
+
+      - name: deps windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # gpg: Git for Windows (уже в образе). zstd: нет в образе — ставим chocolatey-пакетом zstandard
+          # не падаем здесь: если zstd не встал, build-шаг сам даст result: fail
+          if ! command -v zstd >/dev/null 2>&1; then choco install zstandard -y --no-progress || true; fi
+          command -v zstd >/dev/null 2>&1 && echo "zstd: ok" || echo "zstd: нет"
+          command -v gpg >/dev/null 2>&1 && echo "gpg: ok" || echo "gpg: нет"
 
       - name: build
         shell: bash
         env:
           CXR_KEY: ${{ secrets.CXR_KEY }}
+          CXR_NAME: ${{ matrix.name }}
+          CXR_TARGET: ${{ matrix.target }}
+          CXR_BIN: ${{ matrix.bin }}
         run: |
           set +x
           set +e
           echo "::add-mask::$CXR_KEY"
-          T=$RUNNER_TEMP; W=$T/w; L=$T/build.log
+          posix() { if command -v cygpath >/dev/null 2>&1; then cygpath -u "$1"; else printf '%s' "$1"; fi; }
+          export PATH="$PATH:/c/ProgramData/chocolatey/bin"
+          T=$(posix "$RUNNER_TEMP"); W=$T/w; L=$T/build-$CXR_NAME.log
+          SRC=$(posix "$GITHUB_WORKSPACE")
           mkdir -p "$W" "$T/out"
           printf '%s' "$CXR_KEY" > "$T/k"
           chmod 600 "$T/k"
@@ -30,21 +76,21 @@ jobs:
             set -o pipefail
             if ! command -v gpg >/dev/null 2>&1; then brew install gnupg || return 1; fi
             if ! command -v zstd >/dev/null 2>&1; then brew install zstd || return 1; fi
-            gpg --batch --yes --pinentry-mode loopback --passphrase-file "$T/k" -d "$GITHUB_WORKSPACE/src.tar.zst.gpg" | zstd -d | tar -x -C "$W" || return 1
+            gpg --batch --yes --pinentry-mode loopback --passphrase-file "$T/k" -d "$SRC/src.tar.zst.gpg" | zstd -d | tar -x -C "$W" || return 1
             cd "$W" || return 1
-            rustup toolchain install stable --profile minimal -t aarch64-apple-darwin || return 1
+            rustup toolchain install stable --profile minimal -t "$CXR_TARGET" || return 1
             rustup default stable || return 1
             export CARGO_TERM_COLOR=never CARGO_TERM_PROGRESS_WHEN=never CARGO_BUILD_JOBS=3
-            cargo build --release --locked -p horizon-client --bin horizon-client --target aarch64-apple-darwin
+            cargo build --release --locked -p horizon-client --bin horizon-client --target "$CXR_TARGET"
           }
           rc=0
           build >>"$L" 2>&1 || rc=$?
-          BIN=$W/target/aarch64-apple-darwin/release/horizon-client
+          BIN=$W/target/$CXR_TARGET/release/$CXR_BIN
           RES=fail
-          if [ "$rc" -eq 0 ] && [ -f "$BIN" ] && gpg --batch --yes --pinentry-mode loopback --passphrase-file "$T/k" --symmetric --cipher-algo AES256 --compress-algo none -o "$T/out/horizon-client-macos-arm64.gpg" "$BIN" >>"$L" 2>&1; then
+          if [ "$rc" -eq 0 ] && [ -f "$BIN" ] && gpg --batch --yes --pinentry-mode loopback --passphrase-file "$T/k" --symmetric --cipher-algo AES256 --compress-algo none -o "$T/out/horizon-client-$CXR_NAME.gpg" "$BIN" >>"$L" 2>&1; then
             RES=ok
           fi
-          gpg --batch --yes --pinentry-mode loopback --passphrase-file "$T/k" --symmetric --cipher-algo AES256 --compress-algo none -o "$T/out/build-log.gpg" "$L" >/dev/null 2>&1
+          gpg --batch --yes --pinentry-mode loopback --passphrase-file "$T/k" --symmetric --cipher-algo AES256 --compress-algo none -o "$T/out/build-log-$CXR_NAME.gpg" "$L" >/dev/null 2>&1
           END=$(date +%s)
           { echo "CXR_RESULT=$RES"; echo "CXR_SECS=$((END-START))"; } >>"$GITHUB_ENV"
           cd "$T"
@@ -56,7 +102,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: out
+          name: out-${{ matrix.name }}
           path: ${{ runner.temp }}/out/*.gpg
           retention-days: 3
           if-no-files-found: ignore
